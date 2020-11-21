@@ -8,6 +8,10 @@ Run on the command-line:
 
 ```
 $ changelog github.com/kevin-hanselman/changelog
+# github.com/kevin-hanselman/changelog
+
+
+#### `b457bb1` initial commit
 ```
 
 Run as an HTTP server:

@@ -29,18 +29,12 @@ type DecoratedCommit struct {
 }
 
 const baseTemplate = `# {{ .Repo }}
-
 {{ range .Commits }}
 {{ if .Tags }}
-
 ## {{ range .Tags }}{{ . }} {{ end }}
 {{ .Author.When }}
-{{ else }}
-{{ end }}
-
-#### ` + "`{{ slice .HashHexDigest 0 7 }}`" + ` {{ .Message }}
-{{ end }}
-`
+{{ else }}{{ end }}
+#### ` + "`{{ slice .HashHexDigest 0 7 }}`" + ` {{ .Message }}{{ end }}`
 
 var serve string
 
@@ -107,11 +101,19 @@ func cleanRepoPath(repoPath string) string {
 }
 
 func writeChangelog(repoPath string, tmpl *template.Template, out io.Writer) error {
-	repo, err := git.Clone(
-		memory.NewStorage(),
-		nil,
-		&git.CloneOptions{URL: repoPath, SingleBranch: true, NoCheckout: true},
-	)
+	cloneOptions := git.CloneOptions{
+		URL:          repoPath,
+		SingleBranch: true,
+		NoCheckout:   true,
+	}
+
+	// Try cloning the "master" branch first, and if that fails try the "main"
+	// branch.
+	repo, err := git.Clone(memory.NewStorage(), nil, &cloneOptions)
+	if _, ok := err.(git.NoMatchingRefSpecError); ok {
+		cloneOptions.ReferenceName = plumbing.NewBranchReferenceName("main")
+		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
+	}
 	if err != nil {
 		return err
 	}
