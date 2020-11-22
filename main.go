@@ -36,10 +36,15 @@ const baseTemplate = `# {{ .Repo }}
 {{ else }}{{ end }}
 #### ` + "`{{ slice .HashHexDigest 0 7 }}`" + ` {{ .Message }}{{ end }}`
 
-var serve string
+var (
+	onlyTag, serve string
+	maxRevs int
+)
 
 func init() {
 	flag.StringVar(&serve, "serve", "", "serves over HTTP at the given address")
+	flag.StringVar(&onlyTag, "tag", "", "show the changelog for only the given tag")
+	flag.IntVar(&maxRevs, "max-revs", 0, "max versions to show before exiting")
 }
 
 func collectTags(repo *git.Repository) (map[plumbing.Hash][]string, error) {
@@ -100,18 +105,29 @@ func cleanRepoPath(repoPath string) string {
 	return strings.Join([]string{"git://", repoPath}, "")
 }
 
-func writeChangelog(repoPath string, tmpl *template.Template, out io.Writer) error {
+func writeChangelog(repoPath, tag string, maxRevs int, tmpl *template.Template, out io.Writer) error {
 	cloneOptions := git.CloneOptions{
 		URL:          repoPath,
 		SingleBranch: true,
 		NoCheckout:   true,
+		ReferenceName: plumbing.NewBranchReferenceName("master"),
 	}
 
-	// Try cloning the "master" branch first, and if that fails try the "main"
-	// branch.
-	repo, err := git.Clone(memory.NewStorage(), nil, &cloneOptions)
-	if _, ok := err.(git.NoMatchingRefSpecError); ok {
-		cloneOptions.ReferenceName = plumbing.NewBranchReferenceName("main")
+	var (
+		err error
+		repo *git.Repository
+	)
+	if tag == "" {
+		// Try cloning the "master" branch first, and if that fails try the "main"
+		// branch.
+		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
+		if _, ok := err.(git.NoMatchingRefSpecError); ok {
+			cloneOptions.ReferenceName = plumbing.NewBranchReferenceName("main")
+			repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
+		}
+	} else {
+		maxRevs = 1
+		cloneOptions.ReferenceName = plumbing.NewTagReferenceName(tag)
 		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
 	}
 	if err != nil {
@@ -140,6 +156,7 @@ func writeChangelog(repoPath string, tmpl *template.Template, out io.Writer) err
 		goErr <- tmpl.Execute(out, cl)
 	}()
 
+	numTaggedCommits := 0
 	for {
 		commit, err := commitIter.Next()
 		if err == io.EOF {
@@ -148,10 +165,17 @@ func writeChangelog(repoPath string, tmpl *template.Template, out io.Writer) err
 		if err != nil {
 			return err
 		}
+		commitTags, hasTags := tagsByCommit[commit.Hash]
 		decoratedCommit := DecoratedCommit{
 			Commit:        *commit,
 			HashHexDigest: hex.EncodeToString(commit.Hash[:]),
-			Tags:          tagsByCommit[commit.Hash],
+			Tags:          commitTags,
+		}
+		if hasTags {
+			numTaggedCommits++
+		}
+		if maxRevs > 0 && numTaggedCommits > maxRevs {
+			break
 		}
 		select {
 		case cl.Commits <- decoratedCommit:
@@ -165,6 +189,18 @@ func writeChangelog(repoPath string, tmpl *template.Template, out io.Writer) err
 	return <-goErr
 }
 
+func parseRequest(req *http.Request, route string) (repoPath, tag string, err error) {
+	repoPath = strings.TrimPrefix(req.URL.Path, route)
+	parts := strings.Split(repoPath, "@")
+	if len(parts) == 2 {
+		repoPath, tag = parts[0], parts[1]
+	} else if len(parts) > 2 {
+		return "", "", fmt.Errorf("invalid request: %v", req)
+	}
+	repoPath = cleanRepoPath(repoPath)
+	return
+}
+
 func main() {
 	check := func(err error) {
 		if err != nil {
@@ -176,28 +212,31 @@ func main() {
 	tmpl, err := template.New("changelog").Parse(baseTemplate)
 	check(err)
 
-	if serve != "" {
+	if serve == "" {
+		repoPath := flag.Arg(0)
+		if repoPath == "" {
+			flag.Usage()
+			fmt.Println("No repository path specified")
+			os.Exit(1)
+		}
+		_, err := os.Lstat(repoPath)
+		if os.IsNotExist(err) {
+			repoPath = cleanRepoPath(repoPath)
+		}
+		check(writeChangelog(repoPath, onlyTag, maxRevs, tmpl, os.Stdout))
+	} else {
 		primaryRoute := "/"
 		http.HandleFunc(primaryRoute, func(w http.ResponseWriter, req *http.Request) {
-			repoPath := cleanRepoPath(strings.TrimPrefix(req.URL.Path, primaryRoute))
-			log.Printf("processing %#v\n", repoPath)
-			writeChangelog(repoPath, tmpl, w)
+			repoPath, tag, err := parseRequest(req, primaryRoute)
+			if err != nil {
+				return
+			}
+			log.Printf("%#v -> repo: %#v tag: %#v\n", req.URL.String(), repoPath, tag)
+			writeChangelog(repoPath, tag, maxRevs, tmpl, w)
 		})
 		// Ignore requests for a site icon.
 		http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, req *http.Request) {})
 		log.Printf("listening at %s\n", serve)
 		check(http.ListenAndServe(serve, nil))
-	} else {
-		if len(os.Args) < 2 {
-			flag.Usage()
-			fmt.Println("No repository path specified")
-			os.Exit(1)
-		}
-		repoPath := os.Args[1]
-		_, err := os.Lstat(repoPath)
-		if os.IsNotExist(err) {
-			repoPath = cleanRepoPath(repoPath)
-		}
-		check(writeChangelog(repoPath, tmpl, os.Stdout))
 	}
 }
