@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -17,18 +19,20 @@ import (
 	"github.com/go-git/go-git/v5/storage/memory"
 )
 
+// Changelog is the root data structure available to the output template.
 type Changelog struct {
 	Repo    string
 	Commits chan DecoratedCommit
 }
 
+// DecoratedCommit is a go-git Commit struct with additional metadata.
 type DecoratedCommit struct {
 	object.Commit
 	HashHexDigest string
 	Tags          []string
 }
 
-const baseTemplate = `# {{ .Repo }}
+const defaultTemplate = `# {{ .Repo }}
 {{ range .Commits }}
 {{ if .Tags }}
 ## {{ range .Tags }}{{ . }} {{ end }}
@@ -37,13 +41,14 @@ const baseTemplate = `# {{ .Repo }}
 #### ` + "`{{ slice .HashHexDigest 0 7 }}`" + ` {{ .Message }}{{ end }}`
 
 var (
-	onlyTag, serve string
-	maxRevs int
+	onlyTag, serve, templatePath string
+	maxRevs                      int
 )
 
 func init() {
-	flag.StringVar(&serve, "serve", "", "serves over HTTP at the given address")
+	flag.StringVar(&serve, "http", "", "serves over HTTP at the given address")
 	flag.StringVar(&onlyTag, "tag", "", "show the changelog for only the given tag")
+	flag.StringVar(&templatePath, "template", "", "load the output template from the given file")
 	flag.IntVar(&maxRevs, "max-revs", 0, "max versions to show before exiting")
 }
 
@@ -105,28 +110,32 @@ func cleanRepoPath(repoPath string) string {
 	return strings.Join([]string{"git://", repoPath}, "")
 }
 
-func writeChangelog(repoPath, tag string, maxRevs int, tmpl *template.Template, out io.Writer) error {
+func writeChangelog(
+	repoPath,
+	tag string,
+	maxRevs int,
+	tmpl *template.Template,
+	out io.Writer,
+) (err error) {
+	var repo *git.Repository
+
 	cloneOptions := git.CloneOptions{
-		URL:          repoPath,
-		SingleBranch: true,
-		NoCheckout:   true,
+		URL:           repoPath,
+		SingleBranch:  true,
+		NoCheckout:    true,
 		ReferenceName: plumbing.NewBranchReferenceName("master"),
 	}
-
-	var (
-		err error
-		repo *git.Repository
-	)
 	if tag == "" {
-		// Try cloning the "master" branch first, and if that fails try the "main"
-		// branch.
+		// Try cloning master first, and if that fails try main.
 		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
 		if _, ok := err.(git.NoMatchingRefSpecError); ok {
 			cloneOptions.ReferenceName = plumbing.NewBranchReferenceName("main")
 			repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
 		}
 	} else {
-		maxRevs = 1
+		if maxRevs == 0 {
+			maxRevs = 1
+		}
 		cloneOptions.ReferenceName = plumbing.NewTagReferenceName(tag)
 		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
 	}
@@ -152,8 +161,8 @@ func writeChangelog(repoPath, tag string, maxRevs int, tmpl *template.Template, 
 
 	goErr := make(chan error)
 	go func() {
-		defer close(goErr)
 		goErr <- tmpl.Execute(out, cl)
+		close(goErr)
 	}()
 
 	numTaggedCommits := 0
@@ -189,16 +198,26 @@ func writeChangelog(repoPath, tag string, maxRevs int, tmpl *template.Template, 
 	return <-goErr
 }
 
-func parseRequest(req *http.Request, route string) (repoPath, tag string, err error) {
+func parseRequest(req *http.Request, route string) (repoPath, tag string, maxRevs int, err error) {
 	repoPath = strings.TrimPrefix(req.URL.Path, route)
 	parts := strings.Split(repoPath, "@")
 	if len(parts) == 2 {
 		repoPath, tag = parts[0], parts[1]
 	} else if len(parts) > 2 {
-		return "", "", fmt.Errorf("invalid request: %v", req)
+		err = fmt.Errorf("invalid request: %v", req)
+		return
+	}
+	maxRevsStr := req.URL.Query().Get("maxRevs")
+	if maxRevsStr != "" {
+		maxRevs, err = strconv.Atoi(maxRevsStr)
 	}
 	repoPath = cleanRepoPath(repoPath)
 	return
+}
+
+// SplitLines splits the input on newline characters.
+func SplitLines(s string) []string {
+	return strings.Split(s, "\n")
 }
 
 func main() {
@@ -209,7 +228,17 @@ func main() {
 	}
 	flag.Parse()
 
-	tmpl, err := template.New("changelog").Parse(baseTemplate)
+	var (
+		err error
+	)
+	tmpl := template.New("changelog").Funcs(template.FuncMap{"SplitLines": SplitLines})
+	if templatePath == "" {
+		tmpl, err = template.New("changelog").Parse(defaultTemplate)
+	} else {
+		templateContents, err := ioutil.ReadFile(templatePath)
+		check(err)
+		tmpl, err = tmpl.Parse(string(templateContents))
+	}
 	check(err)
 
 	if serve == "" {
@@ -227,11 +256,11 @@ func main() {
 	} else {
 		primaryRoute := "/"
 		http.HandleFunc(primaryRoute, func(w http.ResponseWriter, req *http.Request) {
-			repoPath, tag, err := parseRequest(req, primaryRoute)
+			repoPath, tag, maxRevs, err := parseRequest(req, primaryRoute)
 			if err != nil {
 				return
 			}
-			log.Printf("%#v -> repo: %#v tag: %#v\n", req.URL.String(), repoPath, tag)
+			log.Printf("%#v -> repo: %#v tag: %#v maxRevs: %d\n", req.URL.String(), repoPath, tag, maxRevs)
 			writeChangelog(repoPath, tag, maxRevs, tmpl, w)
 		})
 		// Ignore requests for a site icon.

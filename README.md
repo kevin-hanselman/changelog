@@ -17,7 +17,13 @@ $ changelog github.com/kevin-hanselman/changelog
 Run as an HTTP server:
 
 ```
-$ changelog -serve :8888
+$ changelog -http :8888 &
+
+$ curl localhost:8888/github.com/kevin-hanselman/changelog
+# github.com/kevin-hanselman/changelog
+
+
+#### `b457bb1` initial commit
 ```
 
 Currently the output template is hardcoded and uses Markdown. The plan is to
