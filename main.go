@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -10,13 +11,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 // Changelog is the root data structure available to the output template.
@@ -96,18 +97,33 @@ func collectTags(repo *git.Repository) (map[plumbing.Hash][]string, error) {
 	return tagsByCommit, nil
 }
 
-func cleanRepoPath(repoPath string) string {
-	if strings.HasPrefix(repoPath, "git://") {
-		return repoPath
+func clone(repoURL, tag string) (repo *git.Repository, destDir string, err error) {
+	destDir, err = ioutil.TempDir("", "changelog_")
+	if err != nil {
+		return
 	}
-	prefixes := []string{
-		"http://",
-		"https://",
+
+	args := []string{
+		"clone",
+		"--quiet",
+		"--bare",
+		"--single-branch",
 	}
-	for _, prefix := range prefixes {
-		repoPath = strings.TrimPrefix(repoPath, prefix)
+	if tag != "" {
+		args = append(args, "--branch", tag)
 	}
-	return strings.Join([]string{"git://", repoPath}, "")
+	args = append(args, repoURL, destDir)
+	cmd := exec.Command("git", args...)
+
+	buf := &bytes.Buffer{}
+	cmd.Stderr = buf
+
+	if err = cmd.Run(); err != nil {
+		err = fmt.Errorf("%s: %s", err, buf)
+		return
+	}
+	repo, err = git.PlainOpen(destDir)
+	return
 }
 
 func writeChangelog(
@@ -117,30 +133,15 @@ func writeChangelog(
 	tmpl *template.Template,
 	out io.Writer,
 ) (err error) {
-	var repo *git.Repository
+	repo, repoDir, err := clone(repoPath, tag)
+	defer os.RemoveAll(repoDir)
 
-	cloneOptions := git.CloneOptions{
-		URL:           repoPath,
-		SingleBranch:  true,
-		NoCheckout:    true,
-		ReferenceName: plumbing.NewBranchReferenceName("master"),
-	}
-	if tag == "" {
-		// Try cloning master first, and if that fails try main.
-		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
-		if _, ok := err.(git.NoMatchingRefSpecError); ok {
-			cloneOptions.ReferenceName = plumbing.NewBranchReferenceName("main")
-			repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
-		}
-	} else {
-		if maxRevs == 0 {
-			maxRevs = 1
-		}
-		cloneOptions.ReferenceName = plumbing.NewTagReferenceName(tag)
-		repo, err = git.Clone(memory.NewStorage(), nil, &cloneOptions)
-	}
 	if err != nil {
 		return err
+	}
+
+	if tag != "" && maxRevs == 0 {
+		maxRevs = 1
 	}
 
 	tagsByCommit, err := collectTags(repo)
@@ -155,7 +156,7 @@ func writeChangelog(
 	}
 
 	cl := Changelog{
-		Repo:    strings.TrimPrefix(repoPath, "git://"),
+		Repo:    repoPath,
 		Commits: make(chan DecoratedCommit, 32),
 	}
 
@@ -198,9 +199,19 @@ func writeChangelog(
 	return <-goErr
 }
 
-func parseRequest(req *http.Request, route string) (repoPath, tag string, maxRevs int, err error) {
-	repoPath = strings.TrimPrefix(req.URL.Path, route)
-	parts := strings.Split(repoPath, "@")
+func parseRequest(req *http.Request, route string) (repoURL, tag string, maxRevs int, err error) {
+	repoPath := strings.TrimPrefix(req.URL.Path, route)
+
+	var cloneScheme string
+	parts := strings.SplitN(repoPath, "/", 2)
+	if len(parts) == 2 {
+		cloneScheme, repoPath = parts[0], parts[1]
+	} else {
+		err = fmt.Errorf("invalid request: %v", req)
+		return
+	}
+
+	parts = strings.Split(repoPath, "@")
 	if len(parts) == 2 {
 		repoPath, tag = parts[0], parts[1]
 	} else if len(parts) > 2 {
@@ -211,7 +222,12 @@ func parseRequest(req *http.Request, route string) (repoPath, tag string, maxRev
 	if maxRevsStr != "" {
 		maxRevs, err = strconv.Atoi(maxRevsStr)
 	}
-	repoPath = cleanRepoPath(repoPath)
+
+	if cloneScheme == "ssh" {
+		repoPath = "git@" + repoPath
+	}
+
+	repoURL = fmt.Sprintf("%s://%s", cloneScheme, repoPath)
 	return
 }
 
@@ -248,20 +264,28 @@ func main() {
 			fmt.Println("No repository path specified")
 			os.Exit(1)
 		}
-		_, err := os.Lstat(repoPath)
-		if os.IsNotExist(err) {
-			repoPath = cleanRepoPath(repoPath)
-		}
 		check(writeChangelog(repoPath, onlyTag, maxRevs, tmpl, os.Stdout))
 	} else {
 		primaryRoute := "/"
 		http.HandleFunc(primaryRoute, func(w http.ResponseWriter, req *http.Request) {
-			repoPath, tag, maxRevs, err := parseRequest(req, primaryRoute)
+			repoURL, tag, maxRevs, err := parseRequest(req, primaryRoute)
 			if err != nil {
+				fmt.Fprintln(w, err)
+				log.Println(err)
 				return
 			}
-			log.Printf("%#v -> repo: %#v tag: %#v maxRevs: %d\n", req.URL.String(), repoPath, tag, maxRevs)
-			writeChangelog(repoPath, tag, maxRevs, tmpl, w)
+			log.Printf(
+				"%#v -> repo: %#v tag: %#v maxRevs: %d\n",
+				req.URL.String(),
+				repoURL,
+				tag,
+				maxRevs,
+			)
+			err = writeChangelog(repoURL, tag, maxRevs, tmpl, w)
+			if err != nil {
+				fmt.Fprintln(w, err)
+				log.Println(err)
+			}
 		})
 		// Ignore requests for a site icon.
 		http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, req *http.Request) {})
